@@ -1,0 +1,17 @@
+{
+  "check_runs": [
+    {
+      "name": "Linux CI",
+      "status": "completed",
+      "conclusion": "failure",
+      "details_url": "https://github.com/bytedance/bolt/actions/runs/1/job/2"
+    },
+    {
+      "name": "Format",
+      "status": "completed",
+      "conclusion": "success",
+      "details_url": "https://github.com/bytedance/bolt/actions/runs/1/job/3"
+    }
+  ]
+}
+

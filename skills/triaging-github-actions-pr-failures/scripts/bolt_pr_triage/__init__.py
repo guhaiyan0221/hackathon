@@ -1,0 +1,2 @@
+"""Bolt PR triage package."""
+

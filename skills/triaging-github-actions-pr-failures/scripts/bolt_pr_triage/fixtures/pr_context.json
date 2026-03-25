@@ -1,0 +1,20 @@
+{
+  "number": 42,
+  "title": "Fix flaky test in CI",
+  "html_url": "https://github.com/bytedance/bolt/pull/42",
+  "base": {
+    "sha": "base123"
+  },
+  "head": {
+    "sha": "head456"
+  },
+  "files": [
+    {
+      "filename": "bolt/functions/tests/FlakyTest.cpp"
+    },
+    {
+      "filename": "bolt/functions/lib/Runtime.cpp"
+    }
+  ]
+}
+

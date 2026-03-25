@@ -1,0 +1,5 @@
+{
+  "path": "bolt/functions/tests/FlakyTest.cpp",
+  "content": "TEST_F(FlakySuite, testRaceCondition) {\n  ASSERT_EQ(runQuery(), 4);\n}\n"
+}
+

@@ -1,0 +1,9 @@
+[ RUN      ] FlakySuite.testRaceCondition
+I2026 03:14:15.100 some informational line
+E2026 03:14:15.200 RuntimeError: timeout while waiting for exchange source
+    at bolt::exec::Driver::runInternal
+[  FAILED  ] FlakySuite.testRaceCondition (123 ms)
+Traceback (most recent call last):
+AssertionError: expected 4 rows but got 3
+more noisy line
+

@@ -1,0 +1,14 @@
+{
+  "verdict": "likely_flaky",
+  "summary": "The failure looks nondeterministic and concentrated in a flaky test path.",
+  "root_causes": [
+    "Race condition in exchange source readiness",
+    "Assertion on unstable row count under timing variance"
+  ],
+  "next_actions": [
+    "rerun the failed check",
+    "inspect the flaky test fixture"
+  ],
+  "confidence": "medium"
+}
+
