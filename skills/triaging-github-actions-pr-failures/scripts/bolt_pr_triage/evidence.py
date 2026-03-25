@@ -7,7 +7,8 @@ import re
 from scripts.bolt_pr_triage.models import FailureEvidence
 
 
-FAILED_TEST_PATTERN = re.compile(r"^\[\s*FAILED\s*\]\s+(?P<name>\S+)", re.MULTILINE)
+# Note: CI logs often prefix timestamps, so do not anchor at line start.
+FAILED_TEST_PATTERN = re.compile(r"\[\s*FAILED\s*\]\s+(?P<name>\S+)")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # Many CI logs prefix lines with timestamps; match these markers anywhere in the line.
 _SUMMARY_BLOCK_START_RE = re.compile(r"\b\d+% tests passed, \d+ tests failed out of \d+\b")
@@ -25,6 +26,8 @@ ERROR_SIGNAL_PATTERNS = (
     re.compile(r"^\[bolt-pr-triage\]\s+.+", re.MULTILINE),
     re.compile(r"RuntimeError:\s+.+"),
     re.compile(r"AssertionError:\s+.+"),
+    re.compile(r"\bBoltRuntimeError\b.+"),
+    re.compile(r"\bUnexpected type kind\b.+", re.IGNORECASE),
     # Common CI/build failures
     re.compile(r"\bCMake Error\b.+"),
     re.compile(r"\bninja: build stopped\b.*"),
@@ -36,7 +39,22 @@ ERROR_SIGNAL_PATTERNS = (
 
 def extract_failed_tests(log_text: str) -> list[str]:
     plain = strip_ansi(log_text)
-    return [match.group("name") for match in FAILED_TEST_PATTERN.finditer(plain)]
+    names: list[str] = []
+    for match in FAILED_TEST_PATTERN.finditer(plain):
+        name = match.group("name")
+        # Filter out summary lines like: "[  FAILED  ] 2 tests, listed below:".
+        if not name:
+            continue
+        if name.isdigit():
+            continue
+        if name.lower().startswith("test") and name.rstrip(",").isdigit():
+            continue
+        # Most gtest test identifiers look like Suite.Case or Suite/Param.Case.
+        if "." not in name:
+            continue
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def extract_error_signals(log_text: str) -> list[str]:

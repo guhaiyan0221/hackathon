@@ -16,7 +16,7 @@ from scripts.bolt_pr_triage.github_client import (
     create_client,
     parse_actions_job_id,
 )
-from scripts.bolt_pr_triage.models import TriageResult
+from scripts.bolt_pr_triage.models import PullRequestContext, TriageResult
 from scripts.bolt_pr_triage.report import (
     render_markdown_report,
     render_terminal_summary,
@@ -90,10 +90,114 @@ _CRASH_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CTEST_FAILED_CASE_RE = re.compile(r"\b(?P<num>\d+)\s*-\s*(?P<name>\S+)\s*\(Failed\)")
+_TYPE_UNKNOWN_RE = re.compile(
+    r"Unexpected type kind UNKNOWN|type kind UNKNOWN|buildPhysicalSizeAggregators|WriterContext\.h:538",
+    re.IGNORECASE,
+)
+
+_EXTRACT_UNKNOWN_LINE_RE = re.compile(r".*Unexpected type kind UNKNOWN.*", re.IGNORECASE)
+_EXTRACT_BOLT_RUNTIME_ERROR_RE = re.compile(r".*BoltRuntimeError.*", re.IGNORECASE)
+
+
+def _flatten_text(failures) -> str:
+    parts: list[str] = []
+    for failure in failures:
+        parts.extend(failure.error_signals)
+        parts.extend(failure.log_snippets)
+    return "\n".join(parts)
+
+
+def infer_root_causes(pr_context: PullRequestContext, failures) -> list[str]:
+    text = _flatten_text(failures)
+    causes: list[str] = []
+
+    # Extract concrete error lines first (most useful to users).
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for regex in (_EXTRACT_UNKNOWN_LINE_RE, _EXTRACT_BOLT_RUNTIME_ERROR_RE):
+        for line in lines:
+            if regex.search(line):
+                causes.append(f"直接原因（日志原文）：{line}")
+                break
+        if causes:
+            break
+
+    if _TYPE_UNKNOWN_RE.search(text):
+        causes.append(
+            "Mode 聚合相关用例触发 DWRF Writer 物理大小统计时遇到 UNKNOWN type，抛 INVALID_STATE（WriterContext.h:538 buildPhysicalSizeAggregators）。"
+        )
+        causes.append(
+            "ModeAggregate 可能在某些输入/中间态（例如 unknown/null/decimal）上未正确推导输出类型或未做 UNKNOWN 兜底转换。"
+        )
+
+    # Prefer concrete gtest failures when available.
+    failed_tests: list[str] = []
+    for failure in failures:
+        for t in failure.failed_tests:
+            if t not in failed_tests:
+                failed_tests.append(t)
+    if failed_tests:
+        shown = ", ".join(failed_tests[:5])
+        suffix = f" 等 {len(failed_tests)} 个" if len(failed_tests) > 5 else ""
+        causes.append(f"直接触发失败的用例：{shown}{suffix}。")
+
+    for m in _CTEST_FAILED_CASE_RE.finditer(text):
+        causes.append(f"ctest 失败用例：{m.group('name')}（编号 {m.group('num')}）。")
+        break
+
+    if not causes:
+        causes.append("未能从日志中抽取到明确根因，请人工查看失败用例附近的异常/断言信息。")
+    return causes
+
+
+def infer_next_actions(pr_context: PullRequestContext, failures) -> list[str]:
+    text = _flatten_text(failures)
+    actions: list[str] = []
+
+    # Prefer runnable repro commands.
+    all_failed_tests: list[str] = []
+    for failure in failures:
+        for t in failure.failed_tests:
+            if t not in all_failed_tests:
+                all_failed_tests.append(t)
+
+    if all_failed_tests:
+        filt = ":".join(all_failed_tests[:8])
+        actions.append(
+            f"本地复现（gtest）：`bolt_functions_spark_aggregates_test --gtest_filter={filt}`"
+        )
+        actions.append(
+            "若需要更详细的失败断言/异常栈：加上 `--gtest_break_on_failure` 或 `--gtest_print_time=1` 重新跑。"
+        )
+
+    m = _CTEST_FAILED_CASE_RE.search(text)
+    if m:
+        num = m.group("num")
+        name = m.group("name")
+        actions.append(f"本地复现（ctest）：`ctest -I {num},{num} --output-on-failure -V`")
+        actions.append(f"或按名称跑：`ctest -R {name} --output-on-failure -V`")
+
+    if _TYPE_UNKNOWN_RE.search(text):
+        actions.append(
+            "优先检查 `ModeAggregate.cpp` 的类型推导/输出类型：确保不会把 UNKNOWN type 传入 writer 侧统计；必要时对 UNKNOWN 做显式兜底（例如按 Spark 语义选择返回类型或转换为可序列化类型）。"
+        )
+        actions.append(
+            "沿 `WriterContext.h:538 buildPhysicalSizeAggregators` 调用链回溯，确认触发该路径的写入 schema 是否包含 UNKNOWN kind（与 ModeAggregate 产出相关）。"
+        )
+        actions.append(
+            "如果 UNKNOWN 来自某个输入列/表达式：在 ModeAggregate 的输入类型分支里加日志/断言，定位是哪一种 type kind 未覆盖。"
+        )
+
+    if not actions:
+        actions.append("打开失败的 check 详情页，在首个错误信号附近查看上下文日志。")
+    return actions
+
 
 class _HeuristicLlmClient:
-    def __init__(self, failures_summary: str) -> None:
+    def __init__(self, pr_context: PullRequestContext, failures_summary: str, failures) -> None:
+        self._pr_context = pr_context
         self._failures_summary = failures_summary
+        self._failures = failures
 
     def analyze(self, prompt: str) -> dict[str, object]:
         del prompt
@@ -114,10 +218,8 @@ class _HeuristicLlmClient:
         else:
             confidence = "medium"
 
-        next_actions = [
-            "Open the failing check details URL and inspect the job logs around the first error signal.",
-            "If the failure is a unit test, rerun the test locally and compare stack traces.",
-        ]
+        root_causes = infer_root_causes(self._pr_context, self._failures)
+        next_actions = infer_next_actions(self._pr_context, self._failures)
         if verdict == "likely_flaky":
             next_actions.insert(
                 0,
@@ -128,7 +230,7 @@ class _HeuristicLlmClient:
             "verdict": verdict,
             "confidence": confidence,
             "summary": summary[:8000],
-            "root_causes": ["Heuristic analysis only (no LLM backend configured)."],
+            "root_causes": root_causes,
             "next_actions": next_actions,
         }
 
@@ -201,7 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             triage_result = analyze_case(
                 bundle,
-                _HeuristicLlmClient(_summarize_failures(failures)),
+                _HeuristicLlmClient(pr_context, _summarize_failures(failures), failures),
             )
 
         report_path = args.out or "bolt-pr-triage-report.md"
@@ -218,4 +320,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
