@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from scripts.bolt_pr_triage.models import PullRequestContext, RepoRef
 
@@ -25,15 +25,50 @@ class GitHubAuthError(RuntimeError):
 class GitHubClient:
     headers: dict[str, str]
 
+    def _open_no_redirect(self, req: request.Request):
+        class _NoRedirect(request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = request.build_opener(_NoRedirect())
+        return opener.open(req)
+
     def _get_json(self, url: str) -> Any:
         req = request.Request(url, headers=self.headers)
         with request.urlopen(req) as resp:
             return json.load(resp)
 
     def _get_bytes(self, url: str) -> bytes:
-        req = request.Request(url, headers=self.headers)
-        with request.urlopen(req) as resp:
-            return resp.read()
+        """Fetch raw bytes.
+
+        Important: GitHub Actions logs endpoint often returns 302 to a signed blob URL.
+        We must NOT rely on urllib's default redirect handler, because it may rewrite
+        percent-encoded query parameters (breaking the signed URL). We follow redirects
+        manually and reuse the Location header as-is.
+        """
+
+        current = url
+        for _ in range(5):
+            # Only send GitHub auth headers to api.github.com. Signed blob URLs do not
+            # need Authorization and may fail if the URL is modified.
+            headers: dict[str, str] = {}
+            if urlparse(current).netloc == "api.github.com":
+                headers.update(self.headers)
+
+            req = request.Request(current, headers=headers)
+            try:
+                with self._open_no_redirect(req) as resp:
+                    return resp.read()
+            except HTTPError as exc:
+                if exc.code in {301, 302, 303, 307, 308}:
+                    location = exc.headers.get("Location")
+                    if not location:
+                        raise
+                    current = urljoin(current, location)
+                    continue
+                raise
+
+        raise RuntimeError(f"Too many redirects while fetching: {url}")
 
     def fetch_pr_context(self, pr_url: str) -> PullRequestContext:
         repo_ref, pr_number = parse_pr_url(pr_url)
@@ -181,4 +216,3 @@ def decode_github_file_content(payload: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     return str(content)
-
