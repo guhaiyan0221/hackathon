@@ -1,0 +1,286 @@
+diff --git a/cpp/bolt/compute/WholeStageResultIterator.cc b/cpp/bolt/compute/WholeStageResultIterator.cc
+index cd107a0b2..690781c14 100644
+--- a/cpp/bolt/compute/WholeStageResultIterator.cc
++++ b/cpp/bolt/compute/WholeStageResultIterator.cc
+@@ -46,6 +46,17 @@ namespace gluten {
+ 
+ namespace {
+ 
++std::optional<uint64_t> getOptionalCapacityBytes(
++    const std::shared_ptr<bytedance::bolt::config::ConfigBase>& config,
++    const std::string& key) {
++  if (!config->valueExists(key)) {
++    return std::nullopt;
++  }
++  return bytedance::bolt::config::toCapacity(
++      config->get<std::string>(key, "0B"),
++      bytedance::bolt::config::CapacityUnit::BYTE);
++}
++
+ // metrics
+ const std::string kDynamicFiltersProduced = "dynamicFiltersProduced";
+ const std::string kDynamicFiltersAccepted = "dynamicFiltersAccepted";
+@@ -860,8 +871,18 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
+       configs[bolt::core::QueryConfig::kEnableSonicJsonToMap] =
+         std::to_string(boltCfg_->get<bool>(kEnableSonicJsonToMap, true));
+ 
+-      if (auto retryAggregateMemory = boltCfg_->get<int64_t>(kRetryAggregateMaxPartialAggregationMemory);
+-          retryAggregateMemory.has_value()) {
++      if (auto retryAggregateSpillThreshold =
++              getOptionalCapacityBytes(boltCfg_, kRetryAggregateSpillMemoryThreshold);
++          retryAggregateSpillThreshold.has_value()) {
++        configs[bolt::core::QueryConfig::kAggregationSpillMemoryThreshold] =
++            std::to_string(retryAggregateSpillThreshold.value());
++        configs[bolt::core::QueryConfig::kAggregationSpillEnabled] = "true";
++        LOG(INFO) << "Self-healing retry override applied for aggregate: "
++                  << bolt::core::QueryConfig::kAggregationSpillMemoryThreshold << "="
++                  << configs[bolt::core::QueryConfig::kAggregationSpillMemoryThreshold];
++      } else if (auto retryAggregateMemory =
++                     boltCfg_->get<int64_t>(kRetryAggregateMaxPartialAggregationMemory);
++                 retryAggregateMemory.has_value()) {
+         configs[bolt::core::QueryConfig::kMaxPartialAggregationMemory] =
+             std::to_string(retryAggregateMemory.value());
+         LOG(INFO) << "Self-healing retry override applied for aggregate: "
+@@ -948,7 +969,8 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
+     if (
+         configs.find(bolt::core::QueryConfig::kAggregationSpillMemoryThreshold) ==
+         configs.end()) {
+-      if (auto aggregateSpillThreshold = boltCfg_->get<uint64_t>(kAggregateSpillMemoryThreshold);
++      if (auto aggregateSpillThreshold =
++              getOptionalCapacityBytes(boltCfg_, kAggregateSpillMemoryThreshold);
+           aggregateSpillThreshold.has_value() && aggregateSpillThreshold.value() > 0) {
+         configs[bolt::core::QueryConfig::kAggregationSpillMemoryThreshold] =
+             std::to_string(aggregateSpillThreshold.value());
+@@ -958,7 +980,8 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
+                   << configs[bolt::core::QueryConfig::kAggregationSpillMemoryThreshold];
+       }
+     }
+-    if (auto orderBySpillThreshold = boltCfg_->get<uint64_t>(kOrderBySpillMemoryThreshold);
++    if (auto orderBySpillThreshold =
++            getOptionalCapacityBytes(boltCfg_, kOrderBySpillMemoryThreshold);
+         orderBySpillThreshold.has_value() && orderBySpillThreshold.value() > 0) {
+       configs[bolt::core::QueryConfig::kOrderBySpillMemoryThreshold] =
+           std::to_string(orderBySpillThreshold.value());
+@@ -967,7 +990,8 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
+                 << bolt::core::QueryConfig::kOrderBySpillMemoryThreshold << "="
+                 << configs[bolt::core::QueryConfig::kOrderBySpillMemoryThreshold];
+     }
+-    if (auto hashBuildSpillThreshold = boltCfg_->get<uint64_t>(kHashBuildSpillMemoryThreshold);
++    if (auto hashBuildSpillThreshold =
++            getOptionalCapacityBytes(boltCfg_, kHashBuildSpillMemoryThreshold);
+         hashBuildSpillThreshold.has_value() && hashBuildSpillThreshold.value() > 0) {
+       configs[bolt::core::QueryConfig::kJoinSpillMemoryThreshold] =
+           std::to_string(hashBuildSpillThreshold.value());
+@@ -976,7 +1000,8 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
+                 << bolt::core::QueryConfig::kJoinSpillMemoryThreshold << "="
+                 << configs[bolt::core::QueryConfig::kJoinSpillMemoryThreshold];
+     }
+-    if (auto retryHashBuildSpillThreshold = boltCfg_->get<uint64_t>(kRetryHashBuildJoinSpillMemoryThreshold);
++    if (auto retryHashBuildSpillThreshold =
++            getOptionalCapacityBytes(boltCfg_, kRetryHashBuildJoinSpillMemoryThreshold);
+         retryHashBuildSpillThreshold.has_value()) {
+       configs[bolt::core::QueryConfig::kJoinSpillMemoryThreshold] =
+           std::to_string(retryHashBuildSpillThreshold.value());
+@@ -985,7 +1010,8 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
+                 << bolt::core::QueryConfig::kJoinSpillMemoryThreshold << "="
+                 << configs[bolt::core::QueryConfig::kJoinSpillMemoryThreshold];
+     }
+-    if (auto retryOrderBySpillThreshold = boltCfg_->get<uint64_t>(kRetrySortOrderBySpillMemoryThreshold);
++    if (auto retryOrderBySpillThreshold =
++            getOptionalCapacityBytes(boltCfg_, kRetrySortOrderBySpillMemoryThreshold);
+         retryOrderBySpillThreshold.has_value()) {
+       configs[bolt::core::QueryConfig::kOrderBySpillMemoryThreshold] =
+           std::to_string(retryOrderBySpillThreshold.value());
+diff --git a/tools/bolt-self-healing/bolt_self_healing_demo.py b/tools/bolt-self-healing/bolt_self_healing_demo.py
+deleted file mode 100755
+index e5e7ae638..000000000
+--- a/tools/bolt-self-healing/bolt_self_healing_demo.py
++++ /dev/null
+@@ -1,64 +0,0 @@
+-#!/usr/bin/env python3
+-
+-import argparse
+-
+-from pyspark.sql import SparkSession
+-from pyspark.sql import functions as F
+-
+-
+-def parse_args():
+-    parser = argparse.ArgumentParser(
+-        description="Generate a skewed aggregate workload for Bolt self-healing retry demo."
+-    )
+-    parser.add_argument("--rows", type=int, default=5_000_000)
+-    parser.add_argument("--hot-ratio", type=float, default=0.95)
+-    parser.add_argument("--payload-bytes", type=int, default=4096)
+-    parser.add_argument("--shuffle-partitions", type=int, default=4)
+-    parser.add_argument("--input-partitions", type=int, default=4)
+-    parser.add_argument("--show-plan", action="store_true")
+-    return parser.parse_args()
+-
+-
+-def main():
+-    args = parse_args()
+-    spark = (
+-        SparkSession.builder.appName("bolt-self-healing-demo-aggregate").getOrCreate()
+-    )
+-    spark.conf.set("spark.sql.shuffle.partitions", str(args.shuffle_partitions))
+-
+-    hot_cutoff = int(args.rows * args.hot_ratio)
+-    base = spark.range(0, args.rows, 1, args.input_partitions)
+-
+-    df = (
+-        base.select(
+-            F.when(F.col("id") < F.lit(hot_cutoff), F.lit("hot"))
+-            .otherwise(F.concat(F.lit("k_"), F.col("id").cast("string")))
+-            .alias("k"),
+-            F.repeat(F.lit("x"), args.payload_bytes).alias("payload"),
+-        )
+-        .repartition(args.input_partitions, "k")
+-    )
+-
+-    agg = (
+-        df.groupBy("k")
+-        .agg(
+-            F.count(F.lit(1)).alias("cnt"),
+-            F.sum(F.length("payload")).alias("payload_bytes"),
+-        )
+-        .orderBy(F.desc("cnt"))
+-    )
+-
+-    if args.show_plan:
+-        agg.explain(mode="formatted")
+-
+-    rows = agg.collect()
+-    print(f"result_size={len(rows)}")
+-    print("top10=")
+-    for row in rows[:10]:
+-        print(row)
+-
+-    spark.stop()
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/tools/bolt-self-healing/bolt_self_healing_retry.py b/tools/bolt-self-healing/bolt_self_healing_retry.py
+index 3a2d70637..8f5c74861 100755
+--- a/tools/bolt-self-healing/bolt_self_healing_retry.py
++++ b/tools/bolt-self-healing/bolt_self_healing_retry.py
+@@ -2,6 +2,7 @@
+ 
+ import argparse
+ import os
++import re
+ import subprocess
+ import sys
+ import tempfile
+@@ -55,6 +56,8 @@ RETRY_CONF_BY_OPERATOR = {
+     },
+ }
+ 
++STRUCTURED_HINT_PREFIX = "bolt_self_healing_retry=true;"
++
+ 
+ def parse_args() -> argparse.Namespace:
+     parser = argparse.ArgumentParser(
+@@ -105,6 +108,39 @@ def classify_failure(log_text: str) -> Optional[str]:
+     return None
+ 
+ 
++def parse_structured_retry_conf(log_text: str) -> Optional[Dict[str, str]]:
++    matches = re.findall(
++        rf"{re.escape(STRUCTURED_HINT_PREFIX)}[^\r\n]*", log_text, flags=re.MULTILINE
++    )
++    if not matches:
++        return None
++
++    fields: Dict[str, str] = {}
++    for token in matches[-1].split(";"):
++        if "=" not in token:
++            continue
++        key, value = token.split("=", 1)
++        fields[key] = value
++
++    try:
++        override_count = int(fields.get("override_count", "0"))
++    except ValueError:
++        return None
++
++    if override_count <= 0:
++        return None
++
++    retry_conf: Dict[str, str] = {}
++    for index in range(1, override_count + 1):
++        key = fields.get(f"override_{index}_key")
++        value = fields.get(f"override_{index}_value")
++        if not key or value is None:
++            return None
++        retry_conf[key] = value
++
++    return retry_conf or None
++
++
+ SPARK_SUBMIT_OPTIONS_WITH_VALUES = {
+     "--archives",
+     "--class",
+@@ -200,7 +236,9 @@ def main() -> int:
+     with open(first_log, "r", encoding="utf-8", errors="replace") as fh:
+         first_text = fh.read()
+     operator = classify_failure(first_text)
+-    retry_conf = RETRY_CONF_BY_OPERATOR.get(operator)
++    retry_conf = parse_structured_retry_conf(first_text)
++    if retry_conf is None:
++        retry_conf = RETRY_CONF_BY_OPERATOR.get(operator)
+     if retry_conf is None:
+         print_report(first_log, first_rc, operator, None, None, None)
+         return first_rc
+diff --git a/tools/bolt-self-healing/run_bolt_self_healing_demo.sh b/tools/bolt-self-healing/run_bolt_self_healing_demo.sh
+index 93cb218c9..7f5079276 100755
+--- a/tools/bolt-self-healing/run_bolt_self_healing_demo.sh
++++ b/tools/bolt-self-healing/run_bolt_self_healing_demo.sh
+@@ -7,9 +7,10 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
+ SPARK_HOME=${SPARK_HOME:-/home/guhaiyan/hackathon/spark}
+ SPARK_SUBMIT=${SPARK_SUBMIT:-"${SPARK_HOME}/bin/spark-submit"}
+ GLUTEN_JAR=${GLUTEN_JAR:-"${REPO_ROOT}/output/gluten-spark3.5_2.12-1.0.0-SNAPSHOT-jar-with-dependencies.jar"}
+-DATA_DIR=${DATA_DIR:-/tmp/bolt-self-healing-data}
++DATA_DIR=${DATA_DIR:-"${SCRIPT_DIR}/data"}
+ DATA_PATH=${DATA_PATH:-"${DATA_DIR}/skew_agg_parquet"}
+ WORK_DIR=${WORK_DIR:-"${DATA_DIR}/work"}
++QUERY_OUTPUT_DIR=${QUERY_OUTPUT_DIR:-"${DATA_DIR}/order_by_retry_runtime_out"}
+ 
+ ROWS=${ROWS:-5000000}
+ HOT_RATIO=${HOT_RATIO:-0.95}
+@@ -26,7 +27,8 @@ export PYTHONPYCACHEPREFIX=${PYTHONPYCACHEPREFIX:-/tmp}
+ 
+ JAVA_OPTS=${JAVA_OPTS:---add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true}
+ CREATE_TABLE_SQL="${WORK_DIR}/create_table.sql"
+-QUERY_SQL="${SCRIPT_DIR}/sql/query.sql"
++QUERY_SQL_TEMPLATE="${SCRIPT_DIR}/sql/order_by_retry_runtime.sql"
++QUERY_SQL="${WORK_DIR}/order_by_retry_runtime.sql"
+ 
+ mkdir -p "${WORK_DIR}"
+ 
+@@ -44,6 +46,9 @@ mkdir -p "${WORK_DIR}"
+   --input-partitions "${INPUT_PARTITIONS}"
+ 
+ sed "s|__DATA_PATH__|${DATA_PATH}|g" "${SCRIPT_DIR}/sql/create_table.sql" > "${CREATE_TABLE_SQL}"
++sed \
++  -e "s|__QUERY_OUTPUT_DIR__|${QUERY_OUTPUT_DIR}|g" \
++  "${QUERY_SQL_TEMPLATE}" > "${QUERY_SQL}"
+ 
+ if [[ "${PREPARE_ONLY}" == "1" ]]; then
+   echo "prepared_data_path=${DATA_PATH}"
+diff --git a/tools/bolt-self-healing/sql/order_by_retry_runtime.sql b/tools/bolt-self-healing/sql/order_by_retry_runtime.sql
+new file mode 100644
+index 000000000..1811d7d85
+--- /dev/null
++++ b/tools/bolt-self-healing/sql/order_by_retry_runtime.sql
+@@ -0,0 +1,9 @@
++INSERT OVERWRITE DIRECTORY '__QUERY_OUTPUT_DIR__'
++USING PARQUET
++SELECT k
++FROM bolt_self_healing_src
++WHERE k LIKE 'k_%'
++  AND CAST(SUBSTRING(k, 3) AS INT) < 600000
++ORDER BY concat(k, payload), k;
++
++SELECT 1 AS ok;

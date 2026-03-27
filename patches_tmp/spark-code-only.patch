@@ -1,0 +1,260 @@
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/TaskSetManager.scala b/core/src/main/scala/org/apache/spark/scheduler/TaskSetManager.scala
+index 74fc4092d7b..987b04fd395 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/TaskSetManager.scala
++++ b/core/src/main/scala/org/apache/spark/scheduler/TaskSetManager.scala
+@@ -1362,27 +1362,99 @@ private[spark] object TaskSetManager {
+   private val SelfHealingRetryPrefix = "spark.gluten.sql.columnar.backend.bolt.retry."
+   private val RetryAggregateMaxPartialAggregationMemory =
+     s"${SelfHealingRetryPrefix}aggregate.maxPartialAggregationMemory"
++  private val RetryAggregateSpillMemoryThreshold =
++    s"${SelfHealingRetryPrefix}aggregate.spillMemoryThreshold"
++  private val RetryAggregateMaxExtendedPartialAggregationMemory =
++    s"${SelfHealingRetryPrefix}aggregate.maxExtendedPartialAggregationMemory"
++  private val RetryAggregateAbandonPartialAggregationMinRows =
++    s"${SelfHealingRetryPrefix}aggregate.abandonPartialAggregationMinRows"
++  private val RetryAggregateAbandonPartialAggregationMinPct =
++    s"${SelfHealingRetryPrefix}aggregate.abandonPartialAggregationMinPct"
++  private val RetryAggregateAbandonPartialAggregationMinFinalPct =
++    s"${SelfHealingRetryPrefix}aggregate.abandonPartialAggregationMinFinalPct"
++  private val RetryAggregatePartialAggregationSpillMaxPct =
++    s"${SelfHealingRetryPrefix}aggregate.partialAggregationSpillMaxPct"
+   private val RetryHashBuildJoinSpillMemoryThreshold =
+     s"${SelfHealingRetryPrefix}hashbuild.joinSpillMemoryThreshold"
+   private val RetrySortOrderBySpillMemoryThreshold =
+     s"${SelfHealingRetryPrefix}sort.orderBySpillMemoryThreshold"
++  private val SelfHealingHintPrefix = "bolt_self_healing_retry=true;"
+ 
+   private val OperatorRetryOverrides = Seq(
+-    ("aggregate", RetryAggregateMaxPartialAggregationMemory, "64MB"),
+-    ("hashbuild", RetryHashBuildJoinSpillMemoryThreshold, "64MB"),
+-    ("sort", RetrySortOrderBySpillMemoryThreshold, "64MB"))
++    (
++      "aggregate",
++      Map(RetryAggregateSpillMemoryThreshold -> "4194304"),
++      Seq("partialaggregation", "hashaggregation")
++    ),
++    (
++      "hashbuild",
++      Map(RetryHashBuildJoinSpillMemoryThreshold -> "67108864"),
++      Seq("hashbuild", "join build", "build side")
++    ),
++    (
++      "sort",
++      Map(RetrySortOrderBySpillMemoryThreshold -> "67108864"),
++      Seq("orderby", "sortbuffer")
++    ))
++
++  private def parseSelfHealingHint(errorText: String): Map[String, String] = {
++    val hintStart = errorText.indexOf(SelfHealingHintPrefix)
++    if (hintStart < 0) {
++      Map.empty
++    } else {
++      errorText.substring(hintStart).takeWhile(ch => ch != '\n' && ch != '\r').split(';').iterator
++        .flatMap { token =>
++        token.split("=", 2) match {
++          case Array(key, value) if key.nonEmpty && value.nonEmpty => Some(key -> value)
++          case _ => None
++        }
++      }.toMap
++    }
++  }
++
++  private def parseStructuredOverrides(hint: Map[String, String]): Option[Map[String, String]] = {
++    val count = hint.get("override_count").flatMap(value => scala.util.Try(value.toInt).toOption)
++    count.flatMap { size =>
++      val overrides = (1 to size).flatMap { index =>
++        for {
++          key <- hint.get(s"override_${index}_key")
++          value <- hint.get(s"override_${index}_value")
++        } yield key -> value
++      }.toMap
++      if (overrides.nonEmpty) Some(overrides) else None
++    }
++  }
+ 
+   private def selfHealingOverrideFor(reason: ExceptionFailure): Option[Map[String, String]] = {
+-    val errorText = Option(reason.description).getOrElse("") + "\n" + Option(reason.fullStackTrace).getOrElse("")
++    val errorText =
++      Option(reason.description).getOrElse("") + "\n" +
++        Option(reason.fullStackTrace).getOrElse("")
+     val normalized = errorText.toLowerCase(java.util.Locale.ROOT)
+     if (!containsMemoryFailure(normalized)) {
+       return None
+     }
+ 
++    val hint = parseSelfHealingHint(errorText)
++    val structuredOverride = parseStructuredOverrides(hint)
++    if (structuredOverride.exists(_.nonEmpty)) {
++      return structuredOverride
++    }
++
++    val dynamicOverride = for {
++      retryConf <- hint.get("retry_conf")
++      retryValue <- hint.get("retry_value")
++    } yield Map(retryConf -> retryValue)
++    if (dynamicOverride.exists(_.nonEmpty)) {
++      return dynamicOverride
++    }
++
+     OperatorRetryOverrides.collectFirst {
+-      case (operatorType, confKey, value)
+-          if normalized.contains(s"operator_type=$operatorType") || normalized.contains(confKey.toLowerCase(java.util.Locale.ROOT)) =>
+-        Map(confKey -> value)
++      case (operatorType, retryConf, inferencePatterns)
++          if normalized.contains(s"operator_type=$operatorType") ||
++            retryConf.keys.exists(
++                key => normalized.contains(key.toLowerCase(java.util.Locale.ROOT))) ||
++            inferencePatterns.exists(normalized.contains) =>
++        retryConf
+     }
+   }
+ 
+@@ -1391,6 +1463,8 @@ private[spark] object TaskSetManager {
+       "oom",
+       "outofmemory",
+       "out of memory",
++      "mem_cap_exceeded",
++      "memory pool cap",
+       "memory pressure",
+       "allocation failed",
+       "bad alloc").exists(normalizedErrorText.contains)
+diff --git a/core/src/test/scala/org/apache/spark/scheduler/TaskSetManagerSuite.scala b/core/src/test/scala/org/apache/spark/scheduler/TaskSetManagerSuite.scala
+index 299ef516059..a27f96954ca 100644
+--- a/core/src/test/scala/org/apache/spark/scheduler/TaskSetManagerSuite.scala
++++ b/core/src/test/scala/org/apache/spark/scheduler/TaskSetManagerSuite.scala
+@@ -2214,6 +2214,135 @@ class TaskSetManagerSuite
+     assert(sched.taskSetsFailed.contains(taskSet.id))
+   }
+ 
++  test("Bolt self-healing retry override is injected into the next task attempt") {
++    sc = new SparkContext("local", "test")
++    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
++    val taskSet = FakeTask.createTaskSet(1)
++    taskSet.tasks(0).localProperties.setProperty("spark.test.existing", "keep")
++    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
++
++    val firstAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(firstAttempt.isDefined)
++    assert(firstAttempt.get.properties.getProperty("spark.test.existing") === "keep")
++    assert(
++      firstAttempt.get.properties.getProperty(
++        "spark.gluten.sql.columnar.backend.bolt.retry.aggregate.spillMemoryThreshold") ==
++        null)
++
++    val reason = new ExceptionFailure(
++      "java.lang.RuntimeException",
++        "OOM in HashAggregation | bolt_self_healing_retry=true;operator_type=aggregate;" +
++        "retry_conf=spark.gluten.sql.columnar.backend.bolt.retry.aggregate." +
++        "spillMemoryThreshold",
++      Array.empty,
++      "OOM in HashAggregation | bolt_self_healing_retry=true;operator_type=aggregate;" +
++        "retry_conf=spark.gluten.sql.columnar.backend.bolt.retry.aggregate." +
++        "spillMemoryThreshold",
++      None)
++    manager.handleFailedTask(firstAttempt.get.taskId, TaskState.FAILED, reason)
++
++    val retryAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(retryAttempt.isDefined)
++    val aggregateRetryPrefix =
++      "spark.gluten.sql.columnar.backend.bolt.retry.aggregate."
++    assert(retryAttempt.get.properties.getProperty("spark.test.existing") === "keep")
++    assert(
++      retryAttempt.get.properties.getProperty(
++        aggregateRetryPrefix + "spillMemoryThreshold") ===
++        "4194304")
++  }
++
++  test("Bolt self-healing retry override uses dynamic retry value from Bolt hint") {
++    sc = new SparkContext("local", "test")
++    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
++    val taskSet = FakeTask.createTaskSet(1)
++    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
++
++    val firstAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(firstAttempt.isDefined)
++
++    val reason = new ExceptionFailure(
++      "java.lang.RuntimeException",
++      "OOM in OrderBy | bolt_self_healing_retry=true;operator_type=sort;" +
++        "retry_conf=spark.gluten.sql.columnar.backend.bolt.retry.sort." +
++        "orderBySpillMemoryThreshold;retry_value=31289508",
++      Array.empty,
++      "OOM in OrderBy | bolt_self_healing_retry=true;operator_type=sort;" +
++        "retry_conf=spark.gluten.sql.columnar.backend.bolt.retry.sort." +
++        "orderBySpillMemoryThreshold;retry_value=31289508\nstack trace line",
++      None)
++    manager.handleFailedTask(firstAttempt.get.taskId, TaskState.FAILED, reason)
++
++    val retryAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(retryAttempt.isDefined)
++    val sortRetryPrefix =
++      "spark.gluten.sql.columnar.backend.bolt.retry.sort."
++    assert(
++      retryAttempt.get.properties.getProperty(
++        sortRetryPrefix + "orderBySpillMemoryThreshold") ===
++        "31289508")
++  }
++
++  test("Bolt self-healing retry override is not injected for non-memory failures") {
++    sc = new SparkContext("local", "test")
++    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
++    val taskSet = FakeTask.createTaskSet(1)
++    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
++
++    val firstAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(firstAttempt.isDefined)
++
++    val reason = new ExceptionFailure(
++      "java.lang.RuntimeException",
++        "HashAggregation unsupported input type | " +
++        "bolt_self_healing_retry=true;operator_type=aggregate;" +
++        "retry_conf=spark.gluten.sql.columnar.backend.bolt.retry.aggregate." +
++        "spillMemoryThreshold",
++      Array.empty,
++      "HashAggregation unsupported input type | " +
++        "bolt_self_healing_retry=true;operator_type=aggregate;" +
++        "retry_conf=spark.gluten.sql.columnar.backend.bolt.retry.aggregate." +
++        "spillMemoryThreshold",
++      None)
++    manager.handleFailedTask(firstAttempt.get.taskId, TaskState.FAILED, reason)
++
++    val retryAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(retryAttempt.isDefined)
++    val aggregateRetryPrefix =
++      "spark.gluten.sql.columnar.backend.bolt.retry.aggregate."
++    assert(
++      retryAttempt.get.properties.getProperty(
++        aggregateRetryPrefix + "spillMemoryThreshold") ==
++        null)
++  }
++
++  test("Bolt self-healing retry override is inferred for aggregate MEM_CAP_EXCEEDED") {
++    sc = new SparkContext("local", "test")
++    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
++    val taskSet = FakeTask.createTaskSet(1)
++    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
++
++    val firstAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(firstAttempt.isDefined)
++
++    val reason = new ExceptionFailure(
++      "java.lang.RuntimeException",
++      "Error Code: MEM_CAP_EXCEEDED. Additional Context: Operator: FilterProject[1]",
++      Array.empty,
++      "Reason: Exceeded memory pool cap of 32.00MB while executing op.2.0.0.PartialAggregation",
++      None)
++    manager.handleFailedTask(firstAttempt.get.taskId, TaskState.FAILED, reason)
++
++    val retryAttempt = manager.resourceOffer("exec1", "host1", ANY)._1
++    assert(retryAttempt.isDefined)
++    val aggregateRetryPrefix =
++      "spark.gluten.sql.columnar.backend.bolt.retry.aggregate."
++    assert(
++      retryAttempt.get.properties.getProperty(
++        aggregateRetryPrefix + "spillMemoryThreshold") ===
++        "4194304")
++  }
++
+   test("SPARK-30359: don't clean executorsPendingToRemove " +
+     "at the beginning of CoarseGrainedSchedulerBackend.reset") {
+     val conf = new SparkConf()

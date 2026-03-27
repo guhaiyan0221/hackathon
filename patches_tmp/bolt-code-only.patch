@@ -1,0 +1,1011 @@
+diff --git a/bolt/core/QueryConfig.h b/bolt/core/QueryConfig.h
+index f7fc1c1..059034c 100644
+--- a/bolt/core/QueryConfig.h
++++ b/bolt/core/QueryConfig.h
+@@ -818,18 +818,21 @@ class QueryConfig {
+   }
+ 
+   uint64_t aggregationSpillMemoryThreshold() const {
+-    static constexpr uint64_t kDefault = 0;
+-    return get<uint64_t>(kAggregationSpillMemoryThreshold, kDefault);
++    return config::toCapacity(
++        get<std::string>(kAggregationSpillMemoryThreshold, "0B"),
++        config::CapacityUnit::BYTE);
+   }
+ 
+   uint64_t joinSpillMemoryThreshold() const {
+-    static constexpr uint64_t kDefault = 0;
+-    return get<uint64_t>(kJoinSpillMemoryThreshold, kDefault);
++    return config::toCapacity(
++        get<std::string>(kJoinSpillMemoryThreshold, "0B"),
++        config::CapacityUnit::BYTE);
+   }
+ 
+   uint64_t orderBySpillMemoryThreshold() const {
+-    static constexpr uint64_t kDefault = 0;
+-    return get<uint64_t>(kOrderBySpillMemoryThreshold, kDefault);
++    return config::toCapacity(
++        get<std::string>(kOrderBySpillMemoryThreshold, "0B"),
++        config::CapacityUnit::BYTE);
+   }
+ 
+   uint64_t spillLowCompressByteThreshold() const {
+diff --git a/bolt/exec/OrderBy.cpp b/bolt/exec/OrderBy.cpp
+index 56eb84b..ee149f3 100644
+--- a/bolt/exec/OrderBy.cpp
++++ b/bolt/exec/OrderBy.cpp
+@@ -96,9 +96,14 @@ OrderBy::OrderBy(
+       OperatorMetricKey::kTotalRowCount, folly::to<std::string>(0));
+   this->setRuntimeMetric(
+       OperatorMetricKey::kHasBeenProcessedRowCount, folly::to<std::string>(0));
+-  LOG(INFO) << name() << " construct, output type: " << outputType_->toString()
+-            << ", " << core::QueryConfig::kOrderBySpillMemoryThreshold << "="
+-            << operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold();
++  const auto constructMessage = fmt::format(
++      "{} construct, output type: {}, {}={}",
++      name(),
++      outputType_->toString(),
++      core::QueryConfig::kOrderBySpillMemoryThreshold,
++      operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold());
++  LOG(INFO) << constructMessage;
++  LOG(ERROR) << constructMessage;
+ }
+ 
+ void OrderBy::addInput(RowVectorPtr input) {
+diff --git a/bolt/exec/SortBuffer.cpp b/bolt/exec/SortBuffer.cpp
+index 0bf12cc..9b9d0a1 100644
+--- a/bolt/exec/SortBuffer.cpp
++++ b/bolt/exec/SortBuffer.cpp
+@@ -98,14 +98,43 @@ SortBuffer::SortBuffer(
+       ROW(std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes));
+ }
+ 
+-SortBuffer::~SortBuffer() {
+-  pool_->release();
+-}
+-
+ void SortBuffer::addInput(const VectorPtr& input) {
+   BOLT_CHECK(!noMoreInput_);
++  const auto batchId = ++inputBatchCount_;
++  const auto beforeBytes = pool_->currentBytes();
++  const auto beforeRows = data_->numRows();
++  const auto addInputBeginMessage =
++      fmt::format(
++          "{} addInput begin, batchId={}, inputRows={}, inMemoryRowsBefore={}, currentBytesBefore={}, reservedBytesBefore={}, spillThreshold={}, hasSpiller={}",
++          operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++          batchId,
++          input->size(),
++          beforeRows,
++          succinctBytes(beforeBytes),
++          succinctBytes(pool_->reservedBytes()),
++          spillMemoryThreshold_ == 0 ? std::string("0")
++                                     : succinctBytes(spillMemoryThreshold_),
++          spiller_ != nullptr);
++  LOG(INFO) << addInputBeginMessage;
++  LOG(ERROR) << addInputBeginMessage;
+   ensureInputFits(input);
+ 
++  const auto afterEnsureBytes = pool_->currentBytes();
++  const auto addInputPostEnsureMessage =
++      fmt::format(
++          "{} addInput post-ensure, batchId={}, inputRows={}, inMemoryRowsAfterEnsure={}, currentBytesAfterEnsure={}, reservedBytesAfterEnsure={}, spillThreshold={}, hasSpiller={}",
++          operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++          batchId,
++          input->size(),
++          data_->numRows(),
++          succinctBytes(afterEnsureBytes),
++          succinctBytes(pool_->reservedBytes()),
++          spillMemoryThreshold_ == 0 ? std::string("0")
++                                     : succinctBytes(spillMemoryThreshold_),
++          spiller_ != nullptr);
++  LOG(INFO) << addInputPostEnsureMessage;
++  LOG(ERROR) << addInputPostEnsureMessage;
++
+   SelectivityVector allRows(input->size());
+   std::vector<char*> rows(input->size());
+   for (int row = 0; row < input->size(); ++row) {
+@@ -128,11 +157,30 @@ void SortBuffer::addInput(const VectorPtr& input) {
+   }
+ 
+   numInputRows_ += allRows.size();
++  const auto afterBytes = pool_->currentBytes();
++  const auto crossedThresholdInBatch =
++      spillMemoryThreshold_ != 0 && beforeBytes <= spillMemoryThreshold_ &&
++      afterBytes > spillMemoryThreshold_;
++  const auto addInputEndMessage = fmt::format(
++      "{} addInput end, batchId={}, inputRows={}, inMemoryRowsAfter={}, currentBytesAfter={}, reservedBytesAfter={}, totalInputRows={}, crossedThresholdInBatch={}, thresholdGapAfter={}",
++      operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++      batchId,
++      input->size(),
++      data_->numRows(),
++      succinctBytes(afterBytes),
++      succinctBytes(pool_->reservedBytes()),
++      numInputRows_,
++      crossedThresholdInBatch,
++      spillMemoryThreshold_ == 0
++          ? std::string("n/a")
++          : (afterBytes >= spillMemoryThreshold_
++                 ? fmt::format("+{}", succinctBytes(afterBytes - spillMemoryThreshold_))
++                 : fmt::format("-{}", succinctBytes(spillMemoryThreshold_ - afterBytes))));
++  LOG(INFO) << addInputEndMessage;
++  LOG(ERROR) << addInputEndMessage;
+ }
+ 
+ void SortBuffer::noMoreInput() {
+-  bolt::common::testutil::TestValue::adjust(
+-      "bytedance::bolt::exec::SortBuffer::noMoreInput", this);
+   BOLT_CHECK(!noMoreInput_);
+   noMoreInput_ = true;
+ 
+@@ -141,6 +189,23 @@ void SortBuffer::noMoreInput() {
+     return;
+   }
+ 
++  const auto noMoreInputMessage = fmt::format(
++      "{} noMoreInput begin, numInputRows={}, inMemoryRows={}, currentBytes={}, reservedBytes={}, spillThreshold={}, estimatedOutputRowSize={}, hasSpiller={}, sortCanSpill={}",
++      operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++      numInputRows_,
++      data_->numRows(),
++      succinctBytes(pool_->currentBytes()),
++      succinctBytes(pool_->reservedBytes()),
++      spillMemoryThreshold_ == 0 ? std::string("0")
++                                 : succinctBytes(spillMemoryThreshold_),
++      estimatedOutputRowSize_.has_value()
++          ? succinctBytes(estimatedOutputRowSize_.value())
++          : std::string("n/a"),
++      spiller_ != nullptr,
++      spillConfig_ != nullptr);
++  LOG(INFO) << noMoreInputMessage;
++  LOG(ERROR) << noMoreInputMessage;
++
+   if (spiller_ == nullptr) {
+     BOLT_CHECK_EQ(numInputRows_, data_->numRows());
+     updateEstimatedOutputRowSize();
+@@ -223,7 +288,6 @@ RowVectorPtr SortBuffer::getOutput(uint32_t maxOutputRows) {
+   BOLT_CHECK_GT(numInputRows_, numOutputRows_);
+   const vector_size_t batchSize =
+       std::min<uint64_t>(numInputRows_ - numOutputRows_, maxOutputRows);
+-  ensureOutputFits(batchSize);
+   prepareOutput(batchSize);
+   // bool oldNonReclaimableSection = *nonReclaimableSection_;
+   // auto guard = folly::makeGuard([this, oldNonReclaimableSection]() {
+@@ -267,12 +331,30 @@ std::optional<uint64_t> SortBuffer::estimateOutputRowSize() const {
+ void SortBuffer::ensureInputFits(const VectorPtr& input) {
+   // Check if spilling is enabled or not.
+   if (spillConfig_ == nullptr) {
++    const auto skipSpillMessage = fmt::format(
++        "{} ensureInputFits skip spill, reason=spill_disabled, inputRows={}, currentBytes={}, reservedBytes={}",
++        operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++        input->size(),
++        succinctBytes(pool_->currentBytes()),
++        succinctBytes(pool_->reservedBytes()));
++    LOG(INFO) << skipSpillMessage;
++    LOG(ERROR) << skipSpillMessage;
+     return;
+   }
+ 
+   const int64_t numRows = data_->numRows();
+   if (numRows == 0) {
+     // 'data_' is empty. Nothing to spill.
++    const auto skipSpillMessage = fmt::format(
++        "{} ensureInputFits skip spill, reason=empty_buffer, inputRows={}, currentBytes={}, reservedBytes={}, spillThreshold={}",
++        operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++        input->size(),
++        succinctBytes(pool_->currentBytes()),
++        succinctBytes(pool_->reservedBytes()),
++        spillMemoryThreshold_ == 0 ? std::string("0")
++                                   : succinctBytes(spillMemoryThreshold_));
++    LOG(INFO) << skipSpillMessage;
++    LOG(ERROR) << skipSpillMessage;
+     return;
+   }
+ 
+@@ -283,6 +365,15 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
+ 
+   // Test-only spill path.
+   if (numRows > 0 && testingTriggerSpill()) {
++    const auto triggerMessage = fmt::format(
++        "{} ensureInputFits trigger spill, reason=testing_trigger, inputRows={}, inMemoryRows={}, currentBytes={}, reservedBytes={}",
++        operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++        input->size(),
++        numRows,
++        succinctBytes(pool_->currentBytes()),
++        succinctBytes(pool_->reservedBytes()));
++    LOG(INFO) << triggerMessage;
++    LOG(ERROR) << triggerMessage;
+     spill();
+     return;
+   }
+@@ -291,6 +382,15 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
+   const auto currentMemoryUsage = pool_->currentBytes();
+   if (spillMemoryThreshold_ != 0 &&
+       currentMemoryUsage > spillMemoryThreshold_) {
++    const auto thresholdSpillMessage = fmt::format(
++        "{} ensureInputFits trigger spill by threshold, inputRows={}, inMemoryRows={}, currentBytes={}, spillThreshold={}",
++        operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++        input->size(),
++        numRows,
++        succinctBytes(currentMemoryUsage),
++        succinctBytes(spillMemoryThreshold_));
++    LOG(INFO) << thresholdSpillMessage;
++    LOG(ERROR) << thresholdSpillMessage;
+     spill();
+     return;
+   }
+@@ -300,17 +400,59 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
+   const auto availableReservationBytes = pool_->availableReservation();
+   const int64_t estimatedIncrementalBytes =
+       data_->sizeIncrement(input->size(), outOfLineBytes ? flatInputBytes : 0);
++
++  LOG(INFO) << (operatorCtx_ ? operatorCtx_->toString() : "SortBuffer")
++            << " ensureInputFits"
++            << ", inputRows=" << input->size()
++            << ", inputUsedSize=" << succinctBytes(flatInputBytes)
++            << ", inMemoryRows=" << numRows
++            << ", currentBytes=" << succinctBytes(currentMemoryUsage)
++            << ", reservedBytes=" << succinctBytes(pool_->reservedBytes())
++            << ", availableReservation=" << succinctBytes(availableReservationBytes)
++            << ", estimatedIncrementalBytes="
++            << succinctBytes(estimatedIncrementalBytes)
++            << ", spillThreshold="
++            << (spillMemoryThreshold_ == 0 ? std::string("0")
++                                           : succinctBytes(spillMemoryThreshold_));
++
+   if (availableReservationBytes > minReservationBytes) {
+     // If we have enough free rows for input rows and enough variable length
+     // free space for the vector's flat size, no need for spilling.
+     if (freeRows > input->size() &&
+         (outOfLineBytes == 0 || outOfLineFreeBytes >= flatInputBytes)) {
++      const auto skipSpillMessage = fmt::format(
++          "{} ensureInputFits skip spill, reason=enough_free_space, inputRows={}, inMemoryRows={}, freeRows={}, outOfLineFreeBytes={}, flatInputBytes={}, currentBytes={}, reservedBytes={}, spillThreshold={}",
++          operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++          input->size(),
++          numRows,
++          freeRows,
++          succinctBytes(outOfLineFreeBytes),
++          succinctBytes(flatInputBytes),
++          succinctBytes(currentMemoryUsage),
++          succinctBytes(pool_->reservedBytes()),
++          spillMemoryThreshold_ == 0 ? std::string("0")
++                                     : succinctBytes(spillMemoryThreshold_));
++      LOG(INFO) << skipSpillMessage;
++      LOG(ERROR) << skipSpillMessage;
+       return;
+     }
+ 
+     // If the current available reservation in memory pool is 2X the
+     // estimatedIncrementalBytes, no need to spill.
+     if (availableReservationBytes > 2 * estimatedIncrementalBytes) {
++      const auto skipSpillMessage = fmt::format(
++          "{} ensureInputFits skip spill, reason=enough_reservation, inputRows={}, inMemoryRows={}, currentBytes={}, reservedBytes={}, availableReservation={}, estimatedIncrementalBytes={}, spillThreshold={}",
++          operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++          input->size(),
++          numRows,
++          succinctBytes(currentMemoryUsage),
++          succinctBytes(pool_->reservedBytes()),
++          succinctBytes(availableReservationBytes),
++          succinctBytes(estimatedIncrementalBytes),
++          spillMemoryThreshold_ == 0 ? std::string("0")
++                                     : succinctBytes(spillMemoryThreshold_));
++      LOG(INFO) << skipSpillMessage;
++      LOG(ERROR) << skipSpillMessage;
+       return;
+     }
+   }
+@@ -323,6 +465,18 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
+   {
+     memory::ReclaimableSectionGuard guard(nonReclaimableSection_);
+     if (pool_->maybeReserve(targetIncrementBytes)) {
++      const auto skipSpillMessage = fmt::format(
++          "{} ensureInputFits skip spill, reason=reserve_succeeded, inputRows={}, inMemoryRows={}, currentBytes={}, reservedBytes={}, targetIncrementBytes={}, spillThreshold={}",
++          operatorCtx_ ? operatorCtx_->toString() : "SortBuffer",
++          input->size(),
++          numRows,
++          succinctBytes(currentMemoryUsage),
++          succinctBytes(pool_->reservedBytes()),
++          succinctBytes(targetIncrementBytes),
++          spillMemoryThreshold_ == 0 ? std::string("0")
++                                     : succinctBytes(spillMemoryThreshold_));
++      LOG(INFO) << skipSpillMessage;
++      LOG(ERROR) << skipSpillMessage;
+       return;
+     }
+   }
+@@ -332,36 +486,6 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
+                << ", reservation: " << succinctBytes(pool()->reservedBytes());
+ }
+ 
+-void SortBuffer::ensureOutputFits(vector_size_t batchSize) {
+-  BOLT_CHECK_GT(batchSize, 0);
+-  // Check if spilling is enabled or not.
+-  if (spillConfig_ == nullptr) {
+-    return;
+-  }
+-
+-  // Test-only spill path.
+-  if (testingTriggerSpill()) {
+-    spill();
+-    return;
+-  }
+-
+-  if (estimatedOutputRowSize_.has_value() || spiller_ != nullptr) {
+-    const uint64_t outputBufferSizeToReserve =
+-        estimatedOutputRowSize_.value() * batchSize * 1.2;
+-    {
+-      memory::ReclaimableSectionGuard guard(nonReclaimableSection_);
+-      if (pool_->maybeReserve(outputBufferSizeToReserve)) {
+-        return;
+-      }
+-    }
+-    LOG(WARNING) << "Failed to reserve "
+-                 << succinctBytes(outputBufferSizeToReserve)
+-                 << " for memory pool " << pool_->name()
+-                 << ", usage: " << succinctBytes(pool_->usedBytes())
+-                 << ", reservation: " << succinctBytes(pool_->reservedBytes());
+-  }
+-}
+-
+ void SortBuffer::updateEstimatedOutputRowSize() {
+   const auto optionalRowSize = data_->estimateRowSize();
+   if (!optionalRowSize.has_value() || optionalRowSize.value() == 0) {
+@@ -559,6 +683,16 @@ void SortBuffer::getOutputWithSpill() {
+ 
+ void SortBuffer::finishSpill() {
+   BOLT_CHECK_NULL(spillMerger_);
++  LOG(INFO) << (operatorCtx_ ? operatorCtx_->toString() : "SortBuffer")
++            << " finishSpill begin"
++            << ", currentBytes=" << succinctBytes(pool_->currentBytes())
++            << ", reservedBytes=" << succinctBytes(pool_->reservedBytes())
++            << ", estimatedOutputRowSize="
++            << (estimatedOutputRowSize_.has_value()
++                    ? succinctBytes(estimatedOutputRowSize_.value())
++                    : std::string("n/a"))
++            << ", spillFiles="
++            << (spiller_ ? spiller_->state().numFinishedFiles(0) : 0);
+   auto spillPartition = spiller_->finishSpill();
+   if (spillConfig_->rowBasedSpillMode == common::RowBasedSpillMode::DISABLE) {
+     spillMerger_ = spillPartition.createOrderedReader(
+diff --git a/bolt/exec/SortBuffer.h b/bolt/exec/SortBuffer.h
+index a9cc767..12adbd6 100644
+--- a/bolt/exec/SortBuffer.h
++++ b/bolt/exec/SortBuffer.h
+@@ -59,8 +59,6 @@ class SortBuffer {
+       uint64_t spillMemoryThreshold = 0,
+       OperatorCtx* operatorCtx = nullptr);
+ 
+-  ~SortBuffer();
+-
+   void addInput(const VectorPtr& input);
+ 
+   /// Indicates no more input and triggers either of:
+@@ -149,9 +147,6 @@ class SortBuffer {
+  private:
+   // Ensures there is sufficient memory reserved to process 'input'.
+   void ensureInputFits(const VectorPtr& input);
+-  // Reserves memory for output processing. If reservation cannot be increased,
+-  // spills enough to make output fit.
+-  void ensureOutputFits(vector_size_t outputBatchSize);
+   void updateEstimatedOutputRowSize();
+   // Invoked to initialize or reset the reusable output buffer to get output.
+   void prepareOutput(uint32_t outputBatchSize);
+@@ -191,6 +186,8 @@ class SortBuffer {
+   bool noMoreInput_ = false;
+   // The number of received input rows.
+   size_t numInputRows_ = 0;
++  // Sequential id for each input batch processed by addInput().
++  size_t inputBatchCount_ = 0;
+   // Used to store the input data in row format.
+   std::unique_ptr<RowContainer> data_;
+   std::vector<char*> sortedRows_;
+diff --git a/bolt/exec/Task.cpp b/bolt/exec/Task.cpp
+index 99d40e3..ebdf987 100644
+--- a/bolt/exec/Task.cpp
++++ b/bolt/exec/Task.cpp
+@@ -47,6 +47,7 @@
+ #include "bolt/exec/NestedLoopJoinBuild.h"
+ #include "bolt/exec/OperatorUtils.h"
+ #include "bolt/exec/OutputBufferManager.h"
++#include "bolt/exec/SelfHealingUtils.h"
+ #include "bolt/exec/Task.h"
+ #include "bolt/exec/TaskTraceWriter.h"
+ #include "bolt/exec/TraceConfig.h"
+@@ -2718,6 +2719,18 @@ Task::getLocalExchangeQueues(
+ 
+ void Task::setError(const std::exception_ptr& exception) {
+   BOLT_TEST_ADJUST("bytedance::bolt::exec::Task::setError", this);
++  std::exception_ptr finalException = exception;
++  if (auto message = errorMessageImpl(exception);
++      !message.empty() &&
++      message.find(kSelfHealingHintPrefix) == std::string::npos) {
++    if (auto hint = buildSelfHealingHintFromFailure(message); hint.has_value()) {
++      try {
++        throw std::runtime_error(message + "\n" + hint.value());
++      } catch (const std::runtime_error&) {
++        finalException = std::current_exception();
++      }
++    }
++  }
+   {
+     std::lock_guard<std::timed_mutex> l(mutex_);
+     if (not isRunningLocked()) {
+@@ -2726,7 +2739,7 @@ void Task::setError(const std::exception_ptr& exception) {
+     if (exception_ != nullptr) {
+       return;
+     }
+-    exception_ = exception;
++    exception_ = finalException;
+   }
+   terminate(TaskState::kFailed);
+   if (onError_) {
+diff --git a/bolt/exec/tests/CMakeLists.txt b/bolt/exec/tests/CMakeLists.txt
+index f69560b..841d01c 100644
+--- a/bolt/exec/tests/CMakeLists.txt
++++ b/bolt/exec/tests/CMakeLists.txt
+@@ -83,6 +83,7 @@ add_executable(
+   RowContainerTest.cpp
+   RowNumberTest.cpp
+   RowStreamingWindowTest.cpp
++  SelfHealingUtilsTest.cpp
+   SortAlgoTest.cpp
+   SortAndWindowTest.cpp
+   SortBufferTest.cpp
+diff --git a/bolt/exec/tests/SortBufferTest.cpp b/bolt/exec/tests/SortBufferTest.cpp
+index 6ad2e7e..241b6b2 100644
+--- a/bolt/exec/tests/SortBufferTest.cpp
++++ b/bolt/exec/tests/SortBufferTest.cpp
+@@ -465,68 +465,6 @@ TEST_F(SortBufferTest, spill) {
+   }
+ }
+ 
+-DEBUG_ONLY_TEST_F(SortBufferTest, reserveMemoryGetOutput) {
+-  auto spillDirectory = exec::test::TempDirectoryPath::create();
+-  auto spillConfig = common::SpillConfig(
+-      [&]() -> const std::string& { return spillDirectory->getPath(); },
+-      [&](uint64_t) {},
+-      "0.0.0",
+-      1000,
+-      false,
+-      1 << 20,
+-      executor_.get(),
+-      100,
+-      100000,
+-      0,
+-      0,
+-      0,
+-      0,
+-      0,
+-      0,
+-      "none",
+-      "",
+-      "disabled",
+-      "",
+-      true);
+-  folly::Synchronized<common::SpillStats> spillStats;
+-  auto sortBuffer = std::make_unique<SortBuffer>(
+-      inputType_,
+-      sortColumnIndices_,
+-      sortCompareFlags_,
+-      pool_.get(),
+-      &nonReclaimableSection_,
+-      &spillConfig);
+-
+-  const std::shared_ptr<memory::MemoryPool> fuzzerPool =
+-      memory::memoryManager()->addLeafPool("spillSource");
+-  VectorFuzzer fuzzer({.vectorSize = 1024}, fuzzerPool.get());
+-
+-  TestScopedSpillInjection scopedSpillInjection(0);
+-  for (int i = 0; i < 3; ++i) {
+-    sortBuffer->addInput(fuzzer.fuzzRow(inputType_));
+-  }
+-
+-  std::atomic_bool noMoreInput{false};
+-  SCOPED_TESTVALUE_SET(
+-      "bytedance::bolt::exec::SortBuffer::noMoreInput",
+-      std::function<void(SortBuffer*)>(
+-          ([&](SortBuffer* sortBuffer) { noMoreInput.store(true); })));
+-
+-  std::atomic_int numInputs{0};
+-  SCOPED_TESTVALUE_SET(
+-      "bytedance::bolt::common::memory::MemoryPoolImpl::maybeReserve",
+-      std::function<void(memory::MemoryPoolImpl*)>(
+-          ([&](memory::MemoryPoolImpl* pool) {
+-            if (noMoreInput) {
+-              ++numInputs;
+-            }
+-          })));
+-
+-  sortBuffer->noMoreInput();
+-  sortBuffer->getOutput(10000);
+-  ASSERT_EQ(numInputs, 1);
+-}
+-
+ TEST_F(SortBufferTest, emptySpill) {
+   const std::shared_ptr<memory::MemoryPool> fuzzerPool =
+       memory::memoryManager()->addLeafPool("emptySpillSource");
+diff --git a/bolt/type/tz/TimeZoneMap.cpp b/bolt/type/tz/TimeZoneMap.cpp
+index 3674665..4e95bcb 100644
+--- a/bolt/type/tz/TimeZoneMap.cpp
++++ b/bolt/type/tz/TimeZoneMap.cpp
+@@ -102,8 +102,6 @@ TTimeZoneDatabase buildTimeZoneDatabase(
+         // will be thrown and caller is expected to handle that error in code.
+         LOG(WARNING) << "Invalid time zone [" << entry.second
+                      << "]: " << err.what();
+-        throw std::runtime_error(fmt::format(
+-            "Invalid time zone [{}]: {}", entry.second, err.what()));
+         continue;
+       }
+       timeZonePtr = std::make_unique<TimeZone>(entry.second, entry.first, zone);
+diff --git a/bolt/exec/SelfHealingUtils.h b/bolt/exec/SelfHealingUtils.h
+new file mode 100644
+index 0000000..e120893
+--- /dev/null
++++ b/bolt/exec/SelfHealingUtils.h
+@@ -0,0 +1,367 @@
++#pragma once
++
++#include <algorithm>
++#include <cctype>
++#include <cmath>
++#include <cstdint>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <utility>
++#include <vector>
++#include <string_view>
++
++#include <fmt/format.h>
++#include <glog/logging.h>
++
++namespace bytedance::bolt::exec {
++
++namespace {
++
++inline constexpr const char* kSelfHealingHintPrefix = "bolt_self_healing_retry=true";
++
++struct DominantOperatorUsage {
++  std::string operatorName;
++    std::string operatorType;
++    std::string retryConfKey;
++    uint64_t usageBytes;
++};
++
++struct SelfHealingOverride {
++  std::string key;
++  std::string value;
++};
++
++inline std::string normalizeLower(std::string_view value) {
++  std::string normalized(value);
++  std::transform(
++      normalized.begin(),
++      normalized.end(),
++      normalized.begin(),
++      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++  return normalized;
++}
++
++inline std::string trimCopy(std::string_view value) {
++  size_t begin = 0;
++  while (begin < value.size() &&
++         std::isspace(static_cast<unsigned char>(value[begin]))) {
++    ++begin;
++  }
++  size_t end = value.size();
++  while (end > begin &&
++         std::isspace(static_cast<unsigned char>(value[end - 1]))) {
++    --end;
++  }
++  return std::string(value.substr(begin, end - begin));
++}
++
++inline std::optional<uint64_t> parseByteValueToken(std::string_view token) {
++  const auto valueStart = token.find_first_not_of(' ');
++  if (valueStart == std::string_view::npos) {
++    return std::nullopt;
++  }
++
++  size_t numericEnd = valueStart;
++  while (numericEnd < token.size()) {
++    const auto c = static_cast<unsigned char>(token[numericEnd]);
++    if (!(std::isdigit(c) || c == '.')) {
++      break;
++    }
++    ++numericEnd;
++  }
++  if (numericEnd == valueStart) {
++    return std::nullopt;
++  }
++
++  size_t unitStart = numericEnd;
++  while (unitStart < token.size() &&
++         std::isspace(static_cast<unsigned char>(token[unitStart]))) {
++    ++unitStart;
++  }
++  if (unitStart == token.size()) {
++    return std::nullopt;
++  }
++
++  size_t unitEnd = unitStart;
++  while (unitEnd < token.size() &&
++         std::isalpha(static_cast<unsigned char>(token[unitEnd]))) {
++    ++unitEnd;
++  }
++  if (unitEnd == unitStart) {
++    return std::nullopt;
++  }
++
++  double numericValue = 0.0;
++  try {
++    numericValue =
++        std::stod(std::string(token.substr(valueStart, numericEnd - valueStart)));
++  } catch (const std::exception&) {
++    return std::nullopt;
++  }
++
++  auto unit = std::string(token.substr(unitStart, unitEnd - unitStart));
++  std::transform(unit.begin(), unit.end(), unit.begin(), [](unsigned char c) {
++    return static_cast<char>(std::toupper(c));
++  });
++
++  double multiplier = 0.0;
++  if (unit == "B") {
++    multiplier = 1.0;
++  } else if (unit == "KB") {
++    multiplier = 1024.0;
++  } else if (unit == "MB") {
++    multiplier = 1024.0 * 1024.0;
++  } else if (unit == "GB") {
++    multiplier = 1024.0 * 1024.0 * 1024.0;
++  } else if (unit == "TB") {
++    multiplier = 1024.0 * 1024.0 * 1024.0 * 1024.0;
++  } else {
++    return std::nullopt;
++  }
++
++  return static_cast<uint64_t>(std::llround(numericValue * multiplier));
++}
++
++inline std::optional<uint64_t> parseUsageBytes(std::string_view message) {
++  constexpr std::string_view usagePrefix = "current usage ";
++  constexpr std::string_view requestorPrefix = "requestor '";
++
++  const auto requestorPos = message.find(requestorPrefix);
++  if (requestorPos == std::string_view::npos) {
++    return std::nullopt;
++  }
++
++  const auto usagePos = message.find(usagePrefix);
++  if (usagePos == std::string_view::npos || usagePos >= requestorPos) {
++    return std::nullopt;
++  }
++
++  const auto valueStart = usagePos + usagePrefix.size();
++  return parseByteValueToken(message.substr(valueStart, requestorPos - valueStart));
++}
++
++inline bool isMemoryFailure(std::string_view message) {
++  auto normalized = normalizeLower(message);
++  return normalized.find("oom") != std::string::npos ||
++      normalized.find("outofmemory") != std::string::npos ||
++      normalized.find("out of memory") != std::string::npos ||
++      normalized.find("mem_cap_exceeded") != std::string::npos ||
++      normalized.find("memory pool cap") != std::string::npos ||
++      normalized.find("memory pressure") != std::string::npos ||
++      normalized.find("allocation failed") != std::string::npos ||
++      normalized.find("bad alloc") != std::string::npos ||
++      normalized.find("memory") != std::string::npos;
++}
++
++inline std::optional<DominantOperatorUsage> extractDominantOperatorUsage(
++    std::string_view message) {
++  std::istringstream lines{std::string(message)};
++  std::string line;
++  std::optional<DominantOperatorUsage> dominant;
++
++  while (std::getline(lines, line)) {
++    const auto opPos = line.find("op.");
++    const auto usagePos = line.find(" usage ");
++    if (opPos == std::string::npos || usagePos == std::string::npos || usagePos <= opPos) {
++      continue;
++    }
++
++    const auto operatorPath = trimCopy(
++        std::string_view(line).substr(opPos, usagePos - opPos));
++    const auto nameSep = operatorPath.find_last_of('.');
++    if (nameSep == std::string::npos || nameSep + 1 >= operatorPath.size()) {
++      continue;
++    }
++
++    const auto operatorName = operatorPath.substr(nameSep + 1);
++    const auto usageBytes =
++        parseByteValueToken(std::string_view(line).substr(usagePos + 7));
++    if (!usageBytes.has_value()) {
++      continue;
++    }
++
++    std::string operatorType;
++    std::string retryConfKey;
++    if (operatorName == "OrderBy") {
++      operatorType = "sort";
++      retryConfKey =
++          "spark.gluten.sql.columnar.backend.bolt.retry.sort.orderBySpillMemoryThreshold";
++    } else if (operatorName == "Aggregation") {
++      operatorType = "aggregate";
++      retryConfKey =
++          "spark.gluten.sql.columnar.backend.bolt.retry.aggregate.spillMemoryThreshold";
++    } else if (operatorName == "HashBuild") {
++      operatorType = "hashbuild";
++      retryConfKey =
++          "spark.gluten.sql.columnar.backend.bolt.retry.hashbuild.joinSpillMemoryThreshold";
++    } else {
++      continue;
++    }
++
++    if (!dominant.has_value() || usageBytes.value() > dominant->usageBytes) {
++      dominant = DominantOperatorUsage{
++          operatorName, operatorType, retryConfKey, usageBytes.value()};
++    }
++  }
++  return dominant;
++}
++
++inline std::string detectFailurePhase(std::string_view message) {
++  if (message.find("Operator::addInput failed") != std::string_view::npos) {
++    return "addInput";
++  }
++  if (message.find("Operator::noMoreInput failed") != std::string_view::npos) {
++    return "noMoreInput";
++  }
++  if (message.find("Operator::getOutput failed") != std::string_view::npos) {
++    return "getOutput";
++  }
++  return "unknown";
++}
++
++inline std::string detectCannotSpillReason(std::string_view message) {
++  if (message.find("SortBuffer::finishSpill") != std::string_view::npos) {
++    return "finishSpill";
++  }
++  if (message.find("createRowBasedOrderedReader") != std::string_view::npos) {
++    return "outputMerge";
++  }
++  if (message.find("getOutputWithSpill") != std::string_view::npos) {
++    return "getOutputWithSpill";
++  }
++  return "unknown";
++}
++
++inline std::string formatHint(
++    const std::string& operatorType,
++    const std::string& retryConfKey,
++    std::optional<uint64_t> dominantUsage,
++    const std::string& failurePhase,
++    const std::string& cannotSpillReason,
++    const std::vector<SelfHealingOverride>& overrides) {
++  std::vector<std::string> parts;
++  parts.emplace_back(kSelfHealingHintPrefix);
++  parts.emplace_back(fmt::format("operator_type={}", operatorType));
++  parts.emplace_back(fmt::format("dominant_operator={}", operatorType));
++  if (!retryConfKey.empty()) {
++    parts.emplace_back(fmt::format("retry_conf={}", retryConfKey));
++  }
++  if (dominantUsage.has_value()) {
++    parts.emplace_back(fmt::format("dominant_usage={}", dominantUsage.value()));
++  }
++  parts.emplace_back(fmt::format("failure_phase={}", failurePhase));
++  parts.emplace_back(fmt::format("cannot_spill_reason={}", cannotSpillReason));
++  parts.emplace_back(fmt::format("override_count={}", overrides.size()));
++  for (size_t i = 0; i < overrides.size(); ++i) {
++    parts.emplace_back(fmt::format("override_{}_key={}", i + 1, overrides[i].key));
++    parts.emplace_back(fmt::format("override_{}_value={}", i + 1, overrides[i].value));
++  }
++  std::string hint;
++  for (size_t i = 0; i < parts.size(); ++i) {
++    if (i > 0) {
++      hint += ";";
++    }
++    hint += parts[i];
++  }
++  return hint;
++}
++
++inline std::optional<uint64_t> computeRetryValueBytes(
++    const std::string& operatorType,
++    std::string_view message) {
++  if (operatorType != "sort") {
++    return std::nullopt;
++  }
++
++  if (auto dominant = extractDominantOperatorUsage(message);
++      dominant.has_value() && dominant->operatorType == "sort" &&
++      dominant->usageBytes >= 2) {
++    return dominant->usageBytes / 2;
++  }
++
++  if (message.find("requestor 'op.") == std::string_view::npos ||
++      message.find(".OrderBy'") == std::string_view::npos) {
++    return std::nullopt;
++  }
++  auto usageBytes = parseUsageBytes(message);
++  if (!usageBytes.has_value() || usageBytes.value() < 2) {
++    return std::nullopt;
++  }
++  return usageBytes.value() / 2;
++}
++
++} // namespace
++
++inline std::optional<std::string> buildSelfHealingHint(
++    const std::string& operatorType,
++    const std::string& retryConfKey,
++    const std::string& message) {
++  if (!isMemoryFailure(message)) {
++    return std::nullopt;
++  }
++
++  const auto dominantUsage = extractDominantOperatorUsage(message);
++  const auto failurePhase = detectFailurePhase(message);
++  const auto cannotSpillReason = detectCannotSpillReason(message);
++  const auto retryValue = computeRetryValueBytes(operatorType, message);
++  if (retryValue.has_value()) {
++    LOG(INFO) << "Bolt self-healing retry value computed"
++              << ", operator_type=" << operatorType
++              << ", retry_conf=" << retryConfKey
++              << ", retry_value=" << retryValue.value();
++    return formatHint(
++        operatorType,
++        retryConfKey,
++        dominantUsage.has_value() ? std::make_optional(dominantUsage->usageBytes) : std::nullopt,
++        failurePhase,
++        cannotSpillReason,
++        {{retryConfKey, std::to_string(retryValue.value())}});
++  }
++
++  return formatHint(
++      operatorType,
++      retryConfKey,
++      dominantUsage.has_value() ? std::make_optional(dominantUsage->usageBytes) : std::nullopt,
++      failurePhase,
++      cannotSpillReason,
++      {});
++}
++
++inline std::optional<std::string> buildSelfHealingHintFromFailure(
++    const std::string& message) {
++  if (!isMemoryFailure(message) ||
++      message.find(kSelfHealingHintPrefix) != std::string::npos) {
++    return std::nullopt;
++  }
++
++  const auto dominant = extractDominantOperatorUsage(message);
++  if (!dominant.has_value()) {
++    return std::nullopt;
++  }
++
++  std::vector<SelfHealingOverride> overrides;
++  if (const auto retryValue =
++          computeRetryValueBytes(dominant->operatorType, message);
++      retryValue.has_value()) {
++    overrides.push_back(
++        {dominant->retryConfKey, std::to_string(retryValue.value())});
++  }
++
++  LOG(INFO) << "Bolt self-healing hint generated"
++            << ", dominant_operator=" << dominant->operatorType
++            << ", dominant_usage=" << dominant->usageBytes
++            << ", failure_phase=" << detectFailurePhase(message)
++            << ", cannot_spill_reason=" << detectCannotSpillReason(message)
++            << ", override_count=" << overrides.size();
++
++  return formatHint(
++      dominant->operatorType,
++      dominant->retryConfKey,
++      dominant->usageBytes,
++      detectFailurePhase(message),
++      detectCannotSpillReason(message),
++      overrides);
++}
++
++} // namespace bytedance::bolt::exec
+diff --git a/bolt/exec/tests/SelfHealingUtilsTest.cpp b/bolt/exec/tests/SelfHealingUtilsTest.cpp
+new file mode 100644
+index 0000000..83477df
+--- /dev/null
++++ b/bolt/exec/tests/SelfHealingUtilsTest.cpp
+@@ -0,0 +1,95 @@
++/*
++ * Copyright (c) Facebook, Inc. and its affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
++ * use this file except in compliance with the License. You may obtain a copy of
++ * the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++ * License for the specific language governing permissions and limitations under
++ * the License.
++ *
++ * --------------------------------------------------------------------------
++ * Copyright (c) ByteDance Ltd. and/or its affiliates.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * This modified file is released under the same license.
++ * --------------------------------------------------------------------------
++ */
++
++#include "bolt/exec/SelfHealingUtils.h"
++
++#include <gtest/gtest.h>
++
++namespace bytedance::bolt::exec {
++namespace {
++
++TEST(SelfHealingUtilsTest, BuildsHintForAggregateOom) {
++  auto hint = buildSelfHealingHint(
++      "aggregate",
++      "spark.gluten.sql.columnar.backend.bolt.retry.aggregate.spillMemoryThreshold",
++      "OOM while allocating hash table");
++
++  ASSERT_TRUE(hint.has_value());
++  EXPECT_EQ(
++      hint.value(),
++      "bolt_self_healing_retry=true;operator_type=aggregate;retry_conf="
++      "spark.gluten.sql.columnar.backend.bolt.retry.aggregate.spillMemoryThreshold");
++}
++
++TEST(SelfHealingUtilsTest, DetectsMemoryFailuresCaseInsensitively) {
++  auto hint = buildSelfHealingHint(
++      "sort",
++      "spark.gluten.sql.columnar.backend.bolt.retry.sort.orderBySpillMemoryThreshold",
++      "Bad Alloc in SortBuffer");
++
++  ASSERT_TRUE(hint.has_value());
++  EXPECT_NE(hint.value().find("operator_type=sort"), std::string::npos);
++  EXPECT_NE(
++      hint.value().find(
++          "spark.gluten.sql.columnar.backend.bolt.retry.sort.orderBySpillMemoryThreshold"),
++      std::string::npos);
++}
++
++TEST(SelfHealingUtilsTest, AddsDynamicRetryValueForSortOom) {
++  auto hint = buildSelfHealingHint(
++      "sort",
++      "spark.gluten.sql.columnar.backend.bolt.retry.sort.orderBySpillMemoryThreshold",
++      "Exceeded memory pool cap of 60.00MB with max UNLIMITED when requesting 4.00MB, "
++      "memory manager cap is UNLIMITED, requestor 'op.2.0.0.OrderBy' with current usage "
++      "59.68MB, process RSS is 622.16MB");
++
++  ASSERT_TRUE(hint.has_value());
++  EXPECT_NE(hint.value().find("operator_type=sort"), std::string::npos);
++  EXPECT_NE(
++      hint.value().find(
++          "retry_value=31289508"),
++      std::string::npos);
++}
++
++TEST(SelfHealingUtilsTest, DetectsMemCapExceededFailures) {
++  auto hint = buildSelfHealingHint(
++      "aggregate",
++      "spark.gluten.sql.columnar.backend.bolt.retry.aggregate.spillMemoryThreshold",
++      "Error Code: MEM_CAP_EXCEEDED. Exceeded memory pool cap of 32.00MB");
++
++  ASSERT_TRUE(hint.has_value());
++  EXPECT_NE(hint.value().find("operator_type=aggregate"), std::string::npos);
++  EXPECT_EQ(hint.value().find("retry_value="), std::string::npos);
++}
++
++TEST(SelfHealingUtilsTest, IgnoresNonMemoryFailures) {
++  auto hint = buildSelfHealingHint(
++      "hashbuild",
++      "spark.gluten.sql.columnar.backend.bolt.retry.hashbuild.joinSpillMemoryThreshold",
++      "Unsupported join key type");
++
++  EXPECT_FALSE(hint.has_value());
++}
++
++} // namespace
++} // namespace bytedance::bolt::exec
